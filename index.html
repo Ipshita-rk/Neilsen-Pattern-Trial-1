@@ -158,14 +158,15 @@ precision highp float;
 precision highp int;
 out vec4 o;
 
-uniform vec2 uRes, uOut, uSeed, uCorT, uOffset;
+uniform vec2 uRes, uOut, uSeed, uOffset;
 uniform int uMode, uOctaves, uCount, uLoop;
 uniform float uTime, uLoopLen, uScale, uFluid, uDisturb, uTurb, uStretch, uDrip, uDripFreq, uGravity, uBands;
 uniform float uQ[65];
 uniform vec3 uCol[10];   // OKLab
 uniform float uStop[10];
 uniform float uSoftB[10];
-uniform float uSpeckle, uCorrupt, uGrain, uGrainSize, uGrainT;
+uniform float uSpeckle, uGrain, uGrainSize, uGrainT, uSheen, uBloom, uThread;
+uniform vec3 uThreadCol, uShadowCol;   // OKLab
 
 vec3 mod289(vec3 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
 vec2 mod289(vec2 x) { return x - floor(x * (1.0 / 289.0)) * 289.0; }
@@ -307,17 +308,6 @@ void main() {
   float outMin = min(uOut.x, uOut.y);
   vec2 uv = vec2(frag.x, uRes.y - frag.y) / min(uRes.x, uRes.y);
 
-  // Analog interference: magnetic tearing in sparse horizontal bands + heat shimmer
-  float band = 0.0;
-  if (uMode == 1 && uCorrupt > 0.0) {
-    band = smoothstep(0.45, 0.9, snoise(vec2(px.y / (outMin * 0.035), 3.7) + uCorT));
-    float tear = snoise(vec2(px.y / 2.5, 11.0) + uCorT * 4.0);
-    float dx = uCorrupt * band * (0.4 + 0.6 * tear) * outMin * 0.04;
-    vec2 heat = vec2(snoise(px / (outMin * 0.02) + uCorT + 5.0), snoise(px / (outMin * 0.02) + uCorT + 9.0));
-    vec2 d = vec2(dx, 0.0) + heat * uCorrupt * outMin * 0.005;
-    uv += vec2(d.x, -d.y) / outMin;
-  }
-
   float t = sampleField(uv);
 
   if (uMode == 0) {
@@ -328,23 +318,27 @@ void main() {
 
   float r = rankOf(t);
   float fw = max(fwidth(r), 1e-5);
+  // Slope of the paint surface per unit of image height (y up), used for sheen
+  vec2 slope = vec2(dFdx(t), dFdy(t)) * min(uRes.x, uRes.y);
 
-  // How close is this pixel to a colour boundary (in output px)?
-  float bd = 1.0;
+  // Nearest colour boundary: distance in output px, and which side of it we're on
+  float bd = 1.0, sd = 0.0;
+  int nb = 0;
   for (int i = 0; i < 9; i++) {
     if (i >= uCount - 1) break;
-    bd = min(bd, abs(r - uStop[i]));
+    float d = r - uStop[i];
+    if (abs(d) < bd) { bd = abs(d); sd = d; nb = i; }
   }
-  float edge = exp(-(bd / fw) * k.x / (outMin * 0.015));
+  float edgePx = (bd / fw) * k.x;
+  float edge = exp(-edgePx / (outMin * 0.015));
 
-  // Chemical blotches: patches where the surface is stained and noisier
-  float chemN = fbm(px / (outMin * 0.12) + uSeed * 1.7, 3);
-  float chem = smoothstep(0.12, 0.55, chemN);
+  // Low-frequency patches where specks gather
+  float chem = smoothstep(0.12, 0.55, fbm(px / (outMin * 0.12) + uSeed * 1.7, 3));
 
   vec3 base = paletteLab(r);
   float dark = 1.0 - smoothstep(0.3, 0.85, base.x);
   // Texture density gathers at boundaries and in dark regions
-  float density = clamp(edge + 0.55 * dark + 0.7 * chem * uCorrupt, 0.0, 1.0);
+  float density = clamp(edge + 0.55 * dark, 0.0, 1.0);
 
   vec2 cell = floor(px / uGrainSize);
   float clump = 0.5 + 0.5 * snoise(px * vec2(1.0, 0.45) / (uGrainSize * 6.0) + uSeed);
@@ -363,15 +357,33 @@ void main() {
   // Sparse ink specks that break up smooth areas
   if (hash(cell + 83.0) < uSpeckle * (0.004 + 0.02 * chem + 0.01 * edge)) lab.x *= 0.35;
 
-  // Chemical staining: bleached patches with darker tide-lines
-  float stain = smoothstep(0.08, 0.12, chemN) - smoothstep(0.12, 0.2, chemN);
-  lab = mix(lab, vec3(min(lab.x + 0.1, 1.0), lab.yz * 0.55), chem * uCorrupt * 0.45);
-  lab.x -= stain * uCorrupt * 0.08;
-
   vec3 c = oklabToSrgb(lab);
 
-  // Magnetic bands carry line noise
-  c += band * uCorrupt * (hash(vec2(floor(px.y / 2.0), uGrainT + 7.0)) - 0.5) * 0.18;
+  // Sheen: soft light from the upper left with a glossy highlight on the slopes
+  if (uSheen > 0.0) {
+    const vec3 L = vec3(-0.4537, 0.6050, 0.6655);
+    vec3 n = normalize(vec3(-slope * 0.06, 1.0));
+    float ndl = max(0.0, dot(n, L));
+    float spec = pow(max(0.0, 2.0 * ndl * n.z - L.z), 8.0) * uSheen * 0.6;
+    c = c * (1.0 + uSheen * (0.15 * ndl - 0.1)) + spec;
+  }
+
+  // Gossamer thread: a fine luminous filament along each colour boundary
+  if (uThread > 0.0) {
+    float tw = max(outMin * 0.0018, 0.8 * k.x);
+    float th = uThread * exp(-(edgePx / tw) * (edgePx / tw));
+    c = mix(c, oklabToSrgb(uThreadCol), min(1.0, th));
+  }
+
+  // Shadow bloom: a soft shadow cast onto the darker side of each boundary
+  if (uBloom > 0.0 && uCount > 1) {
+    bool lowerIsDarker = uCol[nb].x < uCol[nb + 1].x;
+    if ((sd < 0.0) == lowerIsDarker) {
+      float bw = outMin * 0.03;
+      float bl = uBloom * exp(-(edgePx / bw) * (edgePx / bw));
+      c = mix(c, oklabToSrgb(uShadowCol), min(1.0, bl * 0.7));
+    }
+  }
 
   vec2 gp = cell + vec2(uGrainT * 37.0, uGrainT * 11.0);
   float g = hash(gp) + hash(gp + vec2(17.0, 91.0)) - 1.0;
@@ -418,7 +430,6 @@ function createRenderer(canvas) {
   function setUniforms(u) {
     gl.uniform2f(loc('uOut'), u.outW, u.outH);
     gl.uniform2f(loc('uSeed'), u.seed[0], u.seed[1]);
-    gl.uniform2f(loc('uCorT'), u.corT[0], u.corT[1]);
     gl.uniform1f(loc('uTime'), u.time);
     gl.uniform1i(loc('uLoop'), u.loop ? 1 : 0);
     gl.uniform1f(loc('uLoopLen'), u.loopLen);
@@ -437,7 +448,11 @@ function createRenderer(canvas) {
     gl.uniform1fv(loc('uStop'), u.stops);
     gl.uniform1fv(loc('uSoftB'), u.softB);
     gl.uniform1f(loc('uSpeckle'), u.speckle);
-    gl.uniform1f(loc('uCorrupt'), u.corrupt);
+    gl.uniform1f(loc('uSheen'), u.sheen);
+    gl.uniform1f(loc('uBloom'), u.bloom);
+    gl.uniform1f(loc('uThread'), u.thread);
+    gl.uniform3fv(loc('uThreadCol'), u.threadCol);
+    gl.uniform3fv(loc('uShadowCol'), u.shadowCol);
     gl.uniform1f(loc('uGrain'), u.grain);
     gl.uniform1f(loc('uGrainSize'), u.grainSize);
     gl.uniform1f(loc('uGrainT'), u.grainT);
@@ -519,7 +534,8 @@ const DEFAULTS = {
   blend: 30,
   size: 1, fluid: 35, disturb: 40, turb: 22, stretch: 30, drip: 35, dripFreq: 15, gravity: 70,
   complexity: 4, bands: 1,
-  grain: 30, grainSize: 1, speckle: 40, corrupt: 20,
+  sheen: 30, bloom: 40, thread: 40,
+  grain: 30, grainSize: 1, speckle: 40,
   animate: false, speed: 30, loop: true, duration: 8, fps: 30,
 };
 
@@ -546,7 +562,11 @@ const GROUPS = [
     { k: 'grain', label: 'Grain', min: 0, max: 100, step: 1 },
     { k: 'grainSize', label: 'Grain size (px)', min: 1, max: 6, step: 0.5 },
     { k: 'speckle', label: 'Speckle', min: 0, max: 100, step: 1 },
-    { k: 'corrupt', label: 'Corruption', min: 0, max: 100, step: 1 },
+  ] },
+  { title: 'Surface', items: [
+    { k: 'sheen', label: 'Sheen', min: 0, max: 100, step: 1 },
+    { k: 'bloom', label: 'Shadow bloom', min: 0, max: 100, step: 1 },
+    { k: 'thread', label: 'Gossamer thread', min: 0, max: 100, step: 1 },
   ] },
   { title: 'Motion', toggle: { k: 'animate', label: 'Animate (colours flow downward)' }, items: [
     { k: 'speed', label: 'Flow speed', min: 0, max: 100, step: 1 },
@@ -642,20 +662,14 @@ function buildUniforms(outW, outH, sec = seconds, frame = frameCount) {
 
   const loop = looping();
   const loopLen = s.duration * flowRate();
-  let time, corT;
-  if (loop) {
-    // Interference drifts round a circle so it also returns to its start
-    const phase = (sec % s.duration) / s.duration;
-    const R = s.duration * 0.15;
-    time = phase * loopLen;
-    corT = [seed[0] + Math.cos(phase * 2 * Math.PI) * R, seed[1] + Math.sin(phase * 2 * Math.PI) * R];
-  } else {
-    time = sec * flowRate();
-    corT = [seed[0] + sec * 0.8, seed[1]];
-  }
+  const time = loop ? ((sec % s.duration) / s.duration) * loopLen : sec * flowRate();
+
+  // Thread is a pale tint of the lightest colour; the shadow a deepened darkest colour
+  const labs = active.map(c => hexToOklab(c.hex)).sort((a, b) => a[0] - b[0]);
+  const lightest = labs[labs.length - 1] || [1, 0, 0], darkest = labs[0] || [0, 0, 0];
 
   return {
-    outW, outH, seed, corT, time, loop, loopLen: Math.max(loopLen, 1e-3),
+    outW, outH, seed, time, loop, loopLen: Math.max(loopLen, 1e-3),
     scale: 1.0 / s.size,
     octaves: s.complexity,
     fluid: s.fluid / 100 * 2,
@@ -668,7 +682,11 @@ function buildUniforms(outW, outH, sec = seconds, frame = frameCount) {
     bands: s.bands,
     count: Math.max(1, active.length), cols, stops, softB,
     speckle: s.speckle / 100,
-    corrupt: s.corrupt / 100,
+    sheen: s.sheen / 100,
+    bloom: s.bloom / 100,
+    thread: s.thread / 100,
+    threadCol: [Math.min(0.99, lightest[0] + 0.06), lightest[1] * 0.6, lightest[2] * 0.6],
+    shadowCol: [darkest[0] * 0.6, darkest[1], darkest[2]],
     grain: s.grain / 100,
     grainSize: s.grainSize,
     grainT: s.animate ? frame % 997 : 0,
