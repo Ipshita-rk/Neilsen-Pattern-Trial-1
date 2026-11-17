@@ -159,7 +159,7 @@ precision highp int;
 out vec4 o;
 
 uniform vec2 uRes, uOut, uSeed, uOffset;
-uniform int uMode, uOctaves, uCount, uLoop;
+uniform int uMode, uOctaves, uCount, uLoop, uLightIdx;
 uniform float uTime, uLoopLen, uScale, uFluid, uDisturb, uTurb, uStretch, uDrip, uDripFreq, uGravity, uBands;
 uniform float uQ[65];
 uniform vec3 uCol[10];   // OKLab
@@ -280,6 +280,13 @@ float rankOf(float t) {
   return r;
 }
 
+// Field value at a given coverage rank (inverse of rankOf)
+float fieldAtRank(float rank) {
+  float f = clamp(rank, 0.0, 1.0) * 64.0;
+  int i = int(min(floor(f), 63.0));
+  return mix(uQ[i], uQ[i + 1], f - float(i));
+}
+
 vec3 paletteLab(float r) {
   vec3 c = uCol[0];
   for (int i = 0; i < 9; i++) {
@@ -368,13 +375,6 @@ void main() {
     c = c * (1.0 + uSheen * (0.15 * ndl - 0.1)) + spec;
   }
 
-  // Gossamer thread: a fine luminous filament along each colour boundary
-  if (uThread > 0.0) {
-    float tw = max(outMin * 0.0018, 0.8 * k.x);
-    float th = uThread * exp(-(edgePx / tw) * (edgePx / tw));
-    c = mix(c, oklabToSrgb(uThreadCol), min(1.0, th));
-  }
-
   // Shadow bloom: a soft shadow cast onto the darker side of each boundary
   if (uBloom > 0.0 && uCount > 1) {
     bool lowerIsDarker = uCol[nb].x < uCol[nb + 1].x;
@@ -385,9 +385,31 @@ void main() {
     }
   }
 
+  // Gossamer thread: a solid luminous line with a soft glow rimming the lightest colour.
+  // Distance is measured on the smooth field (not the stepped rank) so the line stays even.
+  float threadMask = 0.0;
+  if (uThread > 0.0 && uCount > 1) {
+    float gt = max(length(vec2(dFdx(t), dFdy(t))), 1e-6);
+    float td = 1e9;
+    for (int i = 0; i < 9; i++) {
+      if (i >= uCount - 1) break;
+      if (i != uLightIdx && i + 1 != uLightIdx) continue;
+      td = min(td, abs(t - fieldAtRank(uStop[i])));
+    }
+    td = td / gt * k.x;                                    // output px to the nearest boundary
+    float cw = max(outMin * (0.0008 + 0.0022 * uThread), 0.6 * k.x);   // core half-width
+    float gw = outMin * (0.004 + 0.014 * uThread);                     // glow radius
+    float core = (1.0 - smoothstep(cw, cw + 1.5 * k.x, td)) * min(1.0, uThread * 1.6);
+    float glow = uThread * (0.55 * exp(-td / gw) + 0.45 * exp(-(td / (gw * 2.5)) * (td / (gw * 2.5))));
+    vec3 tc = oklabToSrgb(uThreadCol);
+    c = 1.0 - (1.0 - c) * (1.0 - tc * min(1.0, glow * 0.8));   // screen-blend halo
+    c = mix(c, tc, core);
+    threadMask = max(core, glow * 0.6);
+  }
+
   vec2 gp = cell + vec2(uGrainT * 37.0, uGrainT * 11.0);
   float g = hash(gp) + hash(gp + vec2(17.0, 91.0)) - 1.0;
-  c += g * uGrain * (0.3 + 0.9 * density) * 0.3;
+  c += g * uGrain * (0.3 + 0.9 * density) * 0.3 * (1.0 - 0.8 * threadMask);
 
   o = vec4(clamp(c, 0.0, 1.0), 1.0);
 }`;
@@ -451,6 +473,7 @@ function createRenderer(canvas) {
     gl.uniform1f(loc('uSheen'), u.sheen);
     gl.uniform1f(loc('uBloom'), u.bloom);
     gl.uniform1f(loc('uThread'), u.thread);
+    gl.uniform1i(loc('uLightIdx'), u.lightIdx);
     gl.uniform3fv(loc('uThreadCol'), u.threadCol);
     gl.uniform3fv(loc('uShadowCol'), u.shadowCol);
     gl.uniform1f(loc('uGrain'), u.grain);
@@ -664,7 +687,7 @@ function buildUniforms(outW, outH, sec = seconds, frame = frameCount) {
   const loopLen = s.duration * flowRate();
   const time = loop ? ((sec % s.duration) / s.duration) * loopLen : sec * flowRate();
 
-  // Thread is a pale tint of the lightest colour; the shadow a deepened darkest colour
+  // Thread is a near-white tint of the lightest colour; the shadow a deepened darkest colour
   const labs = active.map(c => hexToOklab(c.hex)).sort((a, b) => a[0] - b[0]);
   const lightest = labs[labs.length - 1] || [1, 0, 0], darkest = labs[0] || [0, 0, 0];
 
@@ -685,7 +708,8 @@ function buildUniforms(outW, outH, sec = seconds, frame = frameCount) {
     sheen: s.sheen / 100,
     bloom: s.bloom / 100,
     thread: s.thread / 100,
-    threadCol: [Math.min(0.99, lightest[0] + 0.06), lightest[1] * 0.6, lightest[2] * 0.6],
+    lightIdx: active.reduce((best, c, i, a) => (hexToOklab(c.hex)[0] > hexToOklab(a[best].hex)[0] ? i : best), 0),
+    threadCol: [Math.max(0.97, Math.min(0.995, lightest[0] + 0.1)), lightest[1] * 0.4, lightest[2] * 0.4],
     shadowCol: [darkest[0] * 0.6, darkest[1], darkest[2]],
     grain: s.grain / 100,
     grainSize: s.grainSize,
