@@ -57,6 +57,8 @@
 
   .dims { display: grid; grid-template-columns: 1fr auto 1fr; gap: 6px; align-items: center; margin-bottom: 8px; }
   .dims span { color: var(--muted); }
+  .units { display: grid; grid-template-columns: 1fr auto 72px; gap: 8px; align-items: center; margin-bottom: 8px; }
+  .units label { color: #c4c4cf; }
   .seed { display: grid; grid-template-columns: 104px 1fr auto; gap: 8px; align-items: center; margin-bottom: 8px; }
 
   .coverage { display: flex; height: 10px; border-radius: 5px; overflow: hidden; margin-bottom: 10px; }
@@ -119,11 +121,22 @@
 
   <section>
     <h2>Canvas</h2>
-    <div class="dims">
-      <input type="number" id="w" min="16" max="16000" step="1" aria-label="Width (px)">
-      <span>×</span>
-      <input type="number" id="h" min="16" max="16000" step="1" aria-label="Height (px)">
+    <div class="units">
+      <select id="unit" aria-label="Units">
+        <option value="px">Pixels (px)</option>
+        <option value="in">Inches (in)</option>
+        <option value="cm">Centimetres (cm)</option>
+        <option value="mm">Millimetres (mm)</option>
+      </select>
+      <label for="dpi">DPI</label>
+      <input type="number" id="dpi" min="36" max="1200" step="1">
     </div>
+    <div class="dims">
+      <input type="number" id="w" min="0" aria-label="Width">
+      <span>×</span>
+      <input type="number" id="h" min="0" aria-label="Height">
+    </div>
+    <p class="note" id="sizeInfo"></p>
     <div class="seed">
       <label for="seed">Seed</label>
       <input type="number" id="seed" step="1">
@@ -145,7 +158,7 @@ precision highp float;
 precision highp int;
 out vec4 o;
 
-uniform vec2 uRes, uOut, uSeed, uCorT;
+uniform vec2 uRes, uOut, uSeed, uCorT, uOffset;
 uniform int uMode, uOctaves, uCount, uLoop;
 uniform float uTime, uLoopLen, uScale, uFluid, uDisturb, uTurb, uStretch, uDrip, uDripFreq, uGravity, uBands;
 uniform float uQ[65];
@@ -288,10 +301,11 @@ vec3 oklabToSrgb(vec3 c) {
 }
 
 void main() {
+  vec2 frag = gl_FragCoord.xy + uOffset;  // position within the full image (strip exports)
   vec2 k = uOut / uRes;
-  vec2 px = gl_FragCoord.xy * k;          // output-pixel coordinates
+  vec2 px = frag * k;                     // output-pixel coordinates
   float outMin = min(uOut.x, uOut.y);
-  vec2 uv = vec2(gl_FragCoord.x, uRes.y - gl_FragCoord.y) / min(uRes.x, uRes.y);
+  vec2 uv = vec2(frag.x, uRes.y - frag.y) / min(uRes.x, uRes.y);
 
   // Analog interference: magnetic tearing in sparse horizontal bands + heat shimmer
   float band = 0.0;
@@ -445,6 +459,7 @@ function createRenderer(canvas) {
     gl.viewport(0, 0, w, h);
     setUniforms(u);
     gl.uniform2f(loc('uRes'), w, h);
+    gl.uniform2f(loc('uOffset'), 0, 0);
     gl.uniform1i(loc('uMode'), 0);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
     const px = new Uint8Array(w * h * 4);
@@ -460,12 +475,14 @@ function createRenderer(canvas) {
     return q;
   }
 
-  function draw(u, lut, tile = 0) {
+  // region: draw one strip of a larger image ({ fullW, fullH, offY } in bottom-up pixels)
+  function draw(u, lut, tile = 0, region = null) {
     const W = canvas.width, H = canvas.height;
     gl.bindFramebuffer(gl.FRAMEBUFFER, null);
     gl.viewport(0, 0, W, H);
     setUniforms(u);
-    gl.uniform2f(loc('uRes'), W, H);
+    gl.uniform2f(loc('uRes'), region ? region.fullW : W, region ? region.fullH : H);
+    gl.uniform2f(loc('uOffset'), 0, region ? region.offY : 0);
     gl.uniform1i(loc('uMode'), 1);
     gl.uniform1fv(loc('uQ'), lut);
     if (!tile) { gl.drawArrays(gl.TRIANGLES, 0, 3); return; }
@@ -491,7 +508,7 @@ function createRenderer(canvas) {
 // ---------- State ----------
 
 const DEFAULTS = {
-  width: 3400, height: 704, seed: 1729,
+  width: 3400, height: 704, unit: 'px', dpi: 300, seed: 1729,
   colors: [
     { hex: '#E6E8F4', pct: 14 },
     { hex: '#A8B5E2', pct: 24 },
@@ -874,18 +891,53 @@ sliderRow(BLEND, document.getElementById('colorSection'));
 // ---------- UI: canvas & groups ----------
 
 const wIn = document.getElementById('w'), hIn = document.getElementById('h'), seedIn = document.getElementById('seed');
+const unitSel = document.getElementById('unit'), dpiIn = document.getElementById('dpi');
+const sizeInfo = document.getElementById('sizeInfo');
+const MAX_PX = 30000;
+const PER_INCH = { in: 1, cm: 2.54, mm: 25.4 };
+
+// state.width/height are always pixels; the fields show them in the chosen unit at the chosen DPI
+const toUnit = px => (state.unit === 'px' ? px : +(px / state.dpi * PER_INCH[state.unit]).toFixed(2));
+const fromUnit = v => (state.unit === 'px' ? Math.round(v) : Math.round(v / PER_INCH[state.unit] * state.dpi));
+
+function showDims() {
+  const step = state.unit === 'px' ? 1 : 0.01;
+  for (const [el, key] of [[wIn, 'width'], [hIn, 'height']]) {
+    el.step = step;
+    el.value = toUnit(state[key]);
+    el.setAttribute('aria-label', `${key === 'width' ? 'Width' : 'Height'} (${state.unit})`);
+  }
+  unitSel.value = state.unit;
+  dpiIn.value = state.dpi;
+  const W = state.width, H = state.height, d = state.dpi;
+  const mp = W * H / 1e6;
+  sizeInfo.textContent = `${W} × ${H} px · ${(W / d).toFixed(2)} × ${(H / d).toFixed(2)} in · ` +
+    `${(W / d * 2.54).toFixed(1)} × ${(H / d * 2.54).toFixed(1)} cm at ${d} DPI` +
+    (mp > 60 ? ` · ${Math.round(mp)} megapixels — export will take a while` : '');
+}
 
 function bindDim(input, key) {
   input.addEventListener('change', () => {
-    const v = Math.round(+input.value);
-    if (!v || v < 16) { input.value = state[key]; return; }
-    state[key] = Math.min(v, 16000);
-    input.value = state[key];
-    fitCanvas(); changed();
+    const v = fromUnit(+input.value);
+    if (!v || v < 16) { showDims(); return; }
+    state[key] = Math.min(v, MAX_PX);
+    showDims(); fitCanvas(); changed();
   });
 }
 bindDim(wIn, 'width');
 bindDim(hIn, 'height');
+unitSel.addEventListener('change', () => { state.unit = unitSel.value; showDims(); changed(); });
+dpiIn.addEventListener('change', () => {
+  const d = Math.round(+dpiIn.value);
+  if (!d || d < 36 || d > 1200) { showDims(); return; }
+  // Working in physical units keeps the print size fixed and changes the pixel count
+  if (state.unit !== 'px') {
+    state.width = Math.min(MAX_PX, Math.max(16, Math.round(state.width / state.dpi * d)));
+    state.height = Math.min(MAX_PX, Math.max(16, Math.round(state.height / state.dpi * d)));
+  }
+  state.dpi = d;
+  showDims(); fitCanvas(); changed();
+});
 seedIn.addEventListener('change', () => { state.seed = Math.round(+seedIn.value) || 0; seedIn.value = state.seed; changed(); });
 document.getElementById('seedBtn').addEventListener('click', () => {
   state.seed = Math.floor(Math.random() * 100000); seedIn.value = state.seed; changed();
@@ -931,7 +983,8 @@ function updateModeUI() {
 }
 
 function syncUI() {
-  wIn.value = state.width; hIn.value = state.height; seedIn.value = state.seed;
+  showDims();
+  seedIn.value = state.seed;
   for (const [k, r] of Object.entries(sliderRefs)) {
     if (r.checkbox) r.checkbox.checked = !!state[k];
     else { r.range.value = state[k]; r.num.value = state[k]; }
@@ -1024,18 +1077,91 @@ function download(blob, name) {
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
 }
 
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+
+function pngChunk(type, data) {
+  const head = new Uint8Array(8);
+  new DataView(head.buffer).setUint32(0, data.length);
+  for (let i = 0; i < 4; i++) head[4 + i] = type.charCodeAt(i);
+  let c = 0xFFFFFFFF;
+  for (const part of [head.subarray(4), data]) for (let i = 0; i < part.length; i++) c = CRC_TABLE[(c ^ part[i]) & 255] ^ (c >>> 8);
+  const tail = new Uint8Array(4);
+  new DataView(tail.buffer).setUint32(0, (c ^ 0xFFFFFFFF) >>> 0);
+  return [head, data, tail];
+}
+
+// Renders the image in horizontal strips and streams them into a PNG we assemble ourselves,
+// so print-size images avoid browser canvas limits and carry the chosen DPI (pHYs chunk).
 async function exportPNG() {
-  const W = state.width, H = state.height;
+  if (!('CompressionStream' in window)) throw new Error('This browser is too old to export PNGs. Try a recent Chrome, Edge, Safari or Firefox.');
+  const W = state.width, H = state.height, dpi = state.dpi;
+  const bandH = Math.max(1, Math.min(H, Math.floor(4e6 / W)));
   const off = document.createElement('canvas');
-  off.width = W; off.height = H;
+  off.width = W; off.height = bandH;
   const r = createRenderer(off);
   try {
-    if (Math.max(W, H) > r.maxSize) throw new Error(`Your GPU supports up to ${r.maxSize}px per side.`);
+    if (W > r.maxSize) throw new Error(`Your GPU supports images up to ${r.maxSize}px wide.`);
     const u = buildUniforms(W, H);
-    r.draw(u, r.computeLUT(u), 1024);
-    const blob = await new Promise(res => off.toBlob(res, 'image/png'));
-    if (!blob) throw new Error('Image too large for this browser.');
-    download(blob, `gradient-${state.seed}-${W}x${H}.png`);
+    const lut = r.computeLUT(u);
+
+    const deflate = new CompressionStream('deflate');
+    const writer = deflate.writable.getWriter();
+    const compressed = [];
+    const collecting = (async () => {
+      const rd = deflate.readable.getReader();
+      for (;;) { const { done, value } = await rd.read(); if (done) break; compressed.push(value); }
+    })();
+
+    const rgba = new Uint8Array(W * bandH * 4);
+    const stride = 1 + W * 3;
+    for (let top = 0; top < H; top += bandH) {
+      if (cancelExport) throw new Error('cancelled');
+      const h = Math.min(bandH, H - top);
+      r.draw(u, lut, 1024, { fullW: W, fullH: H, offY: H - top - bandH });
+      r.gl.readPixels(0, bandH - h, W, h, r.gl.RGBA, r.gl.UNSIGNED_BYTE, rgba);
+      // GL rows come bottom-up; PNG rows top-down, each with the "Sub" filter
+      const raw = new Uint8Array(h * stride);
+      for (let j = 0; j < h; j++) {
+        const src = (h - 1 - j) * W * 4, dst = j * stride;
+        raw[dst] = 1;
+        for (let x = 0; x < W; x++) {
+          const s = src + x * 4, d = dst + 1 + x * 3;
+          if (x === 0) { raw[d] = rgba[s]; raw[d + 1] = rgba[s + 1]; raw[d + 2] = rgba[s + 2]; }
+          else {
+            raw[d] = rgba[s] - rgba[s - 4];
+            raw[d + 1] = rgba[s + 1] - rgba[s - 3];
+            raw[d + 2] = rgba[s + 2] - rgba[s - 2];
+          }
+        }
+      }
+      await writer.write(raw);
+      exportBtn.textContent = `Rendering ${Math.round(Math.min(H, top + bandH) / H * 100)}% — click to cancel`;
+      await new Promise(res => setTimeout(res, 0));
+    }
+    await writer.close();
+    await collecting;
+
+    const ihdr = new Uint8Array(13);
+    const iv = new DataView(ihdr.buffer);
+    iv.setUint32(0, W); iv.setUint32(4, H);
+    ihdr[8] = 8; ihdr[9] = 2;                       // 8-bit RGB
+    const phys = new Uint8Array(9);
+    const ppm = Math.round(dpi / 0.0254);           // pixels per metre
+    const pv = new DataView(phys.buffer);
+    pv.setUint32(0, ppm); pv.setUint32(4, ppm); phys[8] = 1;
+    const parts = [new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]),
+      ...pngChunk('IHDR', ihdr), ...pngChunk('pHYs', phys)];
+    for (const c of compressed) parts.push(...pngChunk('IDAT', c));
+    parts.push(...pngChunk('IEND', new Uint8Array(0)));
+    download(new Blob(parts, { type: 'image/png' }), `gradient-${state.seed}-${W}x${H}-${dpi}dpi.png`);
   } finally {
     r.dispose();
   }
